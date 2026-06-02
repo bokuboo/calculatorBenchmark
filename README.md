@@ -1,11 +1,10 @@
 # Calculator Benchmark Suite
 
-A single-file, zero-dependency benchmark for Ubuntu/Linux that measures the **time performance, functional correctness, and limits** of two C++ big-integer calculators against the Linux-native `bc` reference.
+A single-file, zero-dependency benchmark for Ubuntu/Linux that measures the **time performance, functional correctness, and limits** of C++ big-integer calculator against the Linux-native `bc` reference.
 
 | Binary | Source file | Operators | Memory model |
 |--------|-------------|-----------|--------------|
-| `kalkulacka` | `src/main.cpp` | `+` `-` only | `std::vector`, 1 MB reserve |
-| `kalkulacka_2` | `src/calculator.cpp` | `+` `-` `*` `/` `%` `^` `()` unary | 64 MB arena, 2 M digit limit |
+| `kalkulacka_2` | `src/calculator.cpp` | `+` `-` `*` `/` `%` `^` `()` unary | 512 MB arena, 2 M digit limit |
 | `bc` | system (`bc -l`) | all above | arbitrary precision |
 
 ---
@@ -16,7 +15,6 @@ A single-file, zero-dependency benchmark for Ubuntu/Linux that measures the **ti
 .
 ├── run_all.py            # THE FILE — run this
 ├── src/
-│   ├── main.cpp          # calc1 (kalkulacka): +/- only, vector-based
 │   └── calculator.cpp    # calc2 (kalkulacka_2): full op set, arena allocator
 ├── bin/                  # compiled binaries are placed here
 ├── datasets/             # generated test inputs (lazy — created on first run)
@@ -110,13 +108,6 @@ The benchmark automatically:
 
 ## Expected behaviour of each calculator
 
-### `main.cpp` (kalkulacka)
-
-- Correctly handles: sequences of integers joined by `+` or `-`
-- Skips lines starting with `(`
-- Expected: 100 % accuracy on S1, S2, S3, S4, S6
-- Expected: 0 % or PARTIAL on S5 (unsupported operators)
-
 ### `calculator.cpp` (kalkulacka_2)
 
 - Correctly handles: full expressions, all operators, parentheses, unary minus
@@ -196,12 +187,6 @@ The benchmark automatically:
 
 ==============================================================================
        FINAL SCORECARD
-
-  kalkulacka (main.cpp) [+- only]
-    Passed : 7/8 datasets
-    Lines   : 4,200,143
-    Time    : 1.51s
-    Speed   : 2,781K l/s
 
   kalkulacka_2 (calculator.cpp) [full]
     Passed : 8/8 datasets
