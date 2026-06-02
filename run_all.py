@@ -356,29 +356,21 @@ def eval_full(expr):
 
 def _unwrap_bc_lines(path):
     """
-    Generator: yield logical lines from a file that may contain bc/kalkulacka_2
-    backslash-continuation output.
-
-    BUG FIX: Both bc and kalkulacka_2 wrap output lines at 70 chars using
-    a trailing backslash:
-        123456789012345678901234567890123456789012345678901234567890123456789\\
-        0123
-    The original verify() compared physical lines, so every result longer than
-    70 digits was reported as FAIL@L<n>. All S2, S3 (large numbers), S4, and
-    S6 results were wrong for both runners. This function joins continuation
-    lines before comparison.
+    Generator: yield logical lines from a file, efficiently handling
+    backslash-continuation lines without quadratic memory copies.
     """
     with open(path, errors="replace") as fh:
-        pending = ""
+        pending = []
         for raw in fh:
             line = raw.rstrip("\n\r")
             if line.endswith("\\"):
-                pending += line[:-1]
+                pending.append(line[:-1])
             else:
-                yield pending + line
-                pending = ""
+                pending.append(line)
+                yield "".join(pending)
+                pending = []
         if pending:
-            yield pending
+            yield "".join(pending)
 
 
 def _write_ref(src_path, dst_path):
@@ -490,10 +482,9 @@ def run_bc(dataset, log_path):
                 if not s.strip():
                     expr_lines.append("")
                     continue
-                # Translate power operator
-                safe = s.replace("^", "**")
-                # Strip characters bc doesn't understand
-                safe = re.sub(r"[^\d+\-*/%**().\s]", "", safe).strip()
+                # Keep '^' intact! bc handles it natively.
+                # Strip characters bc doesn't understand (allow '^' now)
+                safe = re.sub(r"[^\d+\-*/%^().\s]", "", s).strip()
                 expr_lines.append(safe if safe else "")
 
         body = "\n".join(expr_lines) + "\n"
@@ -548,12 +539,10 @@ def verify(ref_path, out_path, inp_path):
         # ref file is written by us (Python), never wrapped — plain readline is fine.
         # out file comes from bc or kalkulacka_2 — may be wrapped.
         # inp file is the raw dataset — may be multi-line numbers with \ (S6).
-        ref_lines  = _unwrap_bc_lines(ref_path)   # ref is plain, but using the
-                                                    # same unwrapper is harmless
+        ref_lines  = _unwrap_bc_lines(ref_path)
         out_lines  = _unwrap_bc_lines(out_path)
-        inp_lines  = _unwrap_bc_lines(inp_path)
-
-        line_num = 0
+        inp_lines  = (line.strip() for line in open(inp_path, errors="replace")) # <--- The Fix
+        line_num   = 0
         for rv, av, iv in zip(ref_lines, out_lines, inp_lines):
             line_num += 1
             rv = rv.strip()
@@ -818,7 +807,7 @@ def main():
     if single_ds:
         todo = sorted(
             [d for d in all_ds if d == single_ds or single_ds in d],
-            key=lambda x: (int(x[1]) if len(x) > 1 and x[1].isdigit() else x),
+            key=lambda x: x # <--- The Fix: Clean, reliable string comparison
         )
         if not todo:
             print(f"\n  Dataset '{single_ds}' not found. Available:")
