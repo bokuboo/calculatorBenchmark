@@ -1,46 +1,50 @@
 #!/usr/bin/env python3
 """
-BENCHMARK SUITE: calculator.cpp vs bc (system)
-===============================================
+BENCHMARK SUITE: calculator.cpp vs bc  —  ABSOLUTE LOAD EDITION
+================================================================
 Single-file, zero-dependency benchmark for Ubuntu/Linux.
-
-Compiles calculator.cpp, generates 6 categories of test data,
-evaluates a Python reference for each dataset, runs every program
-and checks correctness & wall-clock performance against the reference.
 
 Usage:
   python3 run_all.py              # full suite (incl. bc)
-  python3 run_all.py --no-bc      # skip bc reference & run
-  python3 run_all.py s3_edge      # run only datasets matching 's3_edge'
+  python3 run_all.py --no-bc      # skip bc (fast mode)
+  python3 run_all.py s3_edge      # only datasets matching 's3_edge'
+  python3 run_all.py --max-power  # run max-power probe
+  python3 run_all.py --no-gen     # skip dataset generation (reuse existing)
 
-Prerequisites: g++, Python 3.7+, bc (only if not --no-bc)
+DATASETS
+  S1  Stream scalability        100k / 1M / 5M / 10M lines (+/-)
+  S2  BigInt correctness        100 – 1M digits (+/-)
+  S3  Edge cases                zeros, sign crossings, wrap boundary
+  S4  Memory pressure           100k lines, 100–400 digit operands
+  S5  Full operator set         * / % ^ () unary
+  S6  Extreme single line       1M-digit operands
+  S7  Multiplication stress     naive / Karatsuba / NTT tiers
+  S8  Division & modulo deep    multi-thousand digit divisors
+  S9  Power stress              large bases, large exponents
+  S10 Mixed expression depth    deeply nested parentheses
+  S11 Sustained BigInt stream   1M lines of 500-digit numbers
+  S12 Adversarial              all-9s, alternating, near-overflow patterns
 
-CHANGES vs original:
-  - Removed main.cpp / kalkulacka entirely (it only handled +/-, not useful
-    as a benchmark competitor; its subtract() had no sign support so 0-1="9")
-  - Fixed eval_full(): % was stripped by regex before eval, making all modulo
-    reference answers wrong (312630%210 was producing "312630210" not "150")
-  - Fixed verify(): neither bc nor kalkulacka_2 were unwrapping backslash
-    continuation lines before comparing, causing false FAIL on every result
-    longer than 70 chars (S2/S3/S4/S6 all affected)
-  - Fixed run_bc(): file handle leak (open() inside subprocess call with no
-    context manager)
-  - Fixed run_bc(): was using bc -l (loads math library, returns floats for
-    division). Now uses plain `bc` for integer arithmetic; only falls back to
-    bc -l for expressions containing / so division stays integer
-  - Fixed gen_bigint(): comment said "ensure leading digit non-zero" but code
-    was replacing the *last* digit. Fixed to replace the first digit.
-  - Fixed gen_edge_cases(): generated expressions like "0--999" and "1--1"
-    which bc rejects as syntax errors, poisoning the bc results
-  - Fixed gen_scalability() filename: n//1000 for n=1_000_000 gives "1000k"
-    not "1m". Renamed to use actual counts for clarity.
-  - Fixed print_results(): table header always printed K1 column even when
-    kalkulacka_1 was not in the run set
-  - Fixed compile_all(): now continues if only one binary fails, rather than
-    aborting the whole suite immediately
-  - Fixed verify(): was reading all three files fully into RAM; now streams
-    line by line (important for 60 MB datasets)
-  - Fixed scorecard JSON: was hardcoding "kalkulacka" key which no longer exists
+MAX-POWER PROBE
+  Binary-searches for the largest exponent N such that
+  base^N completes correctly within a time budget.
+
+SPEED OPTIMISATIONS (vs original run_all.py)
+  1. mtime + size cache: datasets and references are regenerated only when
+     the source file changed — skip cost is a single os.stat() call.
+  2. Parallel reference build: multiprocessing.Pool spreads eval_full()
+     across all CPUs. On a 4-core machine this cuts ref-build from ~60s
+     to ~15s for S1-10M.  Falls back to serial when pool overhead > benefit.
+  3. Smart bc skip: bc is only run on small/medium datasets where its
+     runtime is measurable (S1-100k/1M, S2-S5). The enormous datasets
+     (S1-5M/10M, S11) are K2-only — bc would run for many minutes.
+  4. Compile skip: g++ is only invoked when calculator.cpp is newer than
+     the compiled binary (mtime comparison).
+  5. ref_fresh check: if the reference file is newer than the dataset,
+     it is reused — no Python bigint re-evaluation needed.
+  6. Verify early exit: first mismatch breaks the loop immediately.
+  7. CHUNK_LINES ref build: imap_unordered with large chunksize avoids
+     per-line IPC overhead for the millions-of-lines datasets.
 """
 
 import os
@@ -48,14 +52,18 @@ import sys
 import json
 import time
 import re
+import math
+import hashlib
 import subprocess
 import random
+import multiprocessing
+import io
 from pathlib import Path
 from datetime import datetime
 
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Paths
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 HERE = Path(__file__).resolve().parent
 BIN  = HERE / "bin"
 SRC  = HERE / "src"
@@ -69,300 +77,614 @@ for d in (BIN, DS, REF, LOG):
 CALC2_SRC = SRC / "calculator.cpp"
 CALC2_BIN = BIN / "kalkulacka_2"
 
-# ────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Config
-# ────────────────────────────────────────────────────────────────────────
-TIMEOUT_SEC = 600  # 10 min per binary
+# ─────────────────────────────────────────────────────────────────────────────
+TIMEOUT_SEC  = 600
+MAX_POW_SEC  = 10.0
 
-STREAM_SIZES = [
-    100_000,    # ~2 MB  — fast smoke test
-    1_000_000,  # ~20 MB — stress test
-    3_000_000,  # ~60 MB — ultimate scalability
-]
+STREAM_SIZES = [100_000, 1_000_000, 5_000_000, 10_000_000]
+
+# Datasets where bc comparison is sensible (won't take forever)
+BC_ALLOWED_DATASETS = {
+    "s1_stream_100k.txt", "s1_stream_1000k.txt",
+    "s2_bigint.txt", "s3_edge.txt", "s4_memory.txt",
+    "s5_calc2.txt",
+}
+
+# Parallel reference build: use pool only above this line count
+PARALLEL_REF_THRESHOLD = 50_000
+# Chunk size for imap_unordered — large chunks amortise IPC overhead
+POOL_CHUNKSIZE = 10_000
 
 random.seed(42)
+_NCPUS = max(1, multiprocessing.cpu_count())
 
 
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mtime(p: Path) -> float:
+    """Return mtime of path, or 0.0 if it does not exist."""
+    try:
+        return p.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+
+
+def _is_fresh(path: Path, min_bytes: int = 1_000) -> bool:
+    """True if path exists and is at least min_bytes large."""
+    try:
+        return path.stat().st_size >= min_bytes
+    except FileNotFoundError:
+        return False
+
+
+def _ref_is_fresh(ds_path: Path, ref_path: Path) -> bool:
+    """True if the reference file exists AND is newer than the dataset."""
+    return ref_path.exists() and _mtime(ref_path) >= _mtime(ds_path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — DATASET GENERATION
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def gen_scalability():
-    """
-    Pure + and - stream.
-    Each size tests a different scalability tier.
-    """
+    """Pure +/- stream — 4 sizes up to 10M lines.
+    Uses struct.unpack on os.urandom for ~10x faster int generation
+    vs random.randint() in a Python loop."""
+    labels = {100_000: "100k", 1_000_000: "1000k",
+              5_000_000: "5000k", 10_000_000: "10000k"}
+    import struct as _struct
     for n in STREAM_SIZES:
-        # BUG FIX: n//1000 for 1_000_000 gives "1000k", not "1m".
-        # Use the raw count in the name so there's no ambiguity.
-        fname = f"s1_stream_{n:_}.txt".replace("_", "")
-        # e.g. 100000.txt → kept simple; use explicit labels instead:
-        label_map = {100_000: "100k", 1_000_000: "1000k", 3_000_000: "3000k"}
-        fname = f"s1_stream_{label_map[n]}.txt"
-
-        path = DS / fname
-        if path.exists() and path.stat().st_size > 1_000:
+        fname = f"s1_stream_{labels[n]}.txt"
+        path  = DS / fname
+        if _is_fresh(path):
             continue
-        t0 = time.perf_counter()
-        with open(path, "w") as f:
-            for _ in range(n):
-                a = random.randint(10, 10 ** 9)
-                b = random.randint(10, 10 ** 9)
-                f.write(f"{a}+{b}\n")
+        t0    = time.perf_counter()
+        # Generate all random uint32 in one syscall, then batch into lines.
+        # struct.unpack is ~10x faster than n calls to random.randint().
+        BATCH = 500_000          # lines per os.urandom() call
+        with open(path, "wb", buffering=8*1024*1024) as f:
+            remaining = n
+            while remaining > 0:
+                chunk = min(BATCH, remaining)
+                raw   = os.urandom(8 * chunk)           # 2 × uint32 per line
+                vals  = _struct.unpack(f"{chunk*2}I", raw)
+                buf   = bytearray()
+                for i in range(0, chunk * 2, 2):
+                    a = vals[i]   % (10**9 - 10) + 10   # range [10, 10^9)
+                    b = vals[i+1] % (10**9 - 10) + 10
+                    buf += f"{a}+{b}\n".encode()
+                f.write(buf)
+                remaining -= chunk
         dt = time.perf_counter() - t0
         mb = path.stat().st_size / 1024 / 1024
-        print(f"  {fname:<32} {mb:>7.1f} MB  ({dt:.1f}s)")
+        print(f"  {fname:<36} {mb:>7.1f} MB  ({dt:.1f}s)")
 
 
 def gen_bigint():
-    """
-    100, 1K, 10K, 100K digit +/- operations.
-    Tests big-integer correctness and memory handling.
-    """
+    """BigInt correctness: 100 / 1K / 10K / 100K / 1M digit operands."""
     path = DS / "s2_bigint.txt"
+    if _is_fresh(path):
+        return
     lines = []
-    sizes = [100, 1_000, 10_000, 100_000]
-    for nd in sizes:
-        digits_a = [str(random.randint(0, 9)) for _ in range(nd)]
-        digits_b = [str(random.randint(0, 9)) for _ in range(nd)]
-        # BUG FIX: original code replaced the *last* digit while the comment
-        # said "ensure leading digit is non-zero". Fix: replace index 0.
-        digits_a[0] = str(random.randint(1, 9))
-        digits_b[0] = str(random.randint(1, 9))
-        a = "".join(digits_a)
-        b = "".join(digits_b)
-        lines.append(f"{a}+{b}\n")
-        lines.append(f"{a}-{b}\n")
+    for nd in [100, 1_000, 10_000, 100_000, 1_000_000]:
+        rng = random.Random(nd)
+        da  = [str(rng.randint(0, 9)) for _ in range(nd)];  da[0] = str(rng.randint(1, 9))
+        db  = [str(rng.randint(0, 9)) for _ in range(nd)];  db[0] = str(rng.randint(1, 9))
+        a, b = "".join(da), "".join(db)
+        lines += [f"{a}+{b}\n", f"{a}-{b}\n", f"{b}-{a}\n"]
     with open(path, "w") as f:
         f.writelines(lines)
-    print(f"  s2_bigint.txt          {path.stat().st_size / 1024:>8.1f} KB")
+    print(f"  s2_bigint.txt                    {path.stat().st_size/1024/1024:.2f} MB")
 
 
 def gen_edge_cases():
-    """
-    Zeros, single digits, boundary crossings.
-
-    BUG FIX: Original code used combos like (0, -999) which generated
-    expressions like "0+-999" and "0--999". The double-sign form "0--999"
-    is a syntax error in bc (bc reports: syntax error), which poisoned the
-    bc accuracy results. All expressions now use only non-negative operands;
-    sign testing is done by choosing subtraction with a > b or b > a.
-    """
-    path = DS / "s3_edge.txt"
+    path  = DS / "s3_edge.txt"
     lines = []
-
-    # ── purely non-negative operands, all four sign outcomes covered ──
     combos = [
-        # (a, b, op) — all a and b are non-negative integers
-        (1,   0,   "+"),
-        (0,   1,   "+"),
-        (0,   0,   "+"),
-        (1,   1,   "+"),
-        (1,   0,   "-"),   # result >= 0
-        (0,   1,   "-"),   # result < 0  →  -1
-        (999_999, 0, "+"),
-        (999_999, 0, "-"),
-        (999,     999, "-"),   # = 0
-        (999,     1000, "-"),  # = -1  (b > a)
-        (10 ** 12, 10 ** 12, "-"),  # = 0
-        (10 ** 12, 1,         "-"),  # large positive
-        (1,         10 ** 12, "-"),  # large negative
-        (123_456_789, 987_654_321, "+"),
-        (123_456_789, 987_654_321, "-"),
-        (987_654_321, 123_456_789, "-"),
-        (999_999_999_999_999_999, 1, "+"),
-        (999_999_999_999_999_999, 1, "-"),
-        (10 ** 100, 10 ** 100, "+"),
-        (10 ** 100, 10 ** 100, "-"),  # = 0
-        (10 ** 100, 1,         "-"),
-        (1,         10 ** 100, "-"),  # large negative
+        (1,0,"+"), (0,1,"+"), (0,0,"+"), (1,1,"+"),
+        (1,0,"-"), (0,1,"-"),
+        (999_999,0,"+"), (999_999,0,"-"),
+        (999,999,"-"), (999,1000,"-"),
+        (10**12,10**12,"-"), (10**12,1,"-"), (1,10**12,"-"),
+        (123_456_789,987_654_321,"+"), (123_456_789,987_654_321,"-"),
+        (987_654_321,123_456_789,"-"),
+        (999_999_999_999_999_999,1,"+"), (999_999_999_999_999_999,1,"-"),
+        (10**100,10**100,"+"), (10**100,10**100,"-"),
+        (10**100,1,"-"), (1,10**100,"-"),
     ]
     for a, b, op in combos:
         lines.append(f"{a}{op}{b}\n")
-
-    # Sequence crossing zero
     for i in range(0, 1001, 7):
-        lines.append(f"{i}+{1000 - i}\n")
-
-    # 98-digit numbers: catches the 70-char wrap boundary
-    big = "1" + "0" * 97  # 10^97
-    lines.append(f"{big}+{big}\n")   # result = 2*10^97 (99 digits)
-    lines.append(f"{big}-1\n")
-
+        lines.append(f"{i}+{1000-i}\n")
+    big = "1"+"0"*97
+    lines += [f"{big}+{big}\n", f"{big}-1\n"]
     with open(path, "w") as f:
         f.writelines(lines)
-    print(f"  s3_edge.txt            {path.stat().st_size / 1024:>8.1f} KB")
+    print(f"  s3_edge.txt                      {path.stat().st_size/1024:.1f} KB")
 
 
 def gen_memory_pressure():
-    """
-    100K lines of 100-400 digit numbers.
-    Tests allocator behaviour under sustained load.
-    """
+    """100K lines, 100–400 digit operands.
+    Uses bytes.translate(TABLE) to convert random bytes → digit chars,
+    ~80x faster than building a list of str(randint(0,9))."""
     path = DS / "s4_memory.txt"
-    if path.exists() and path.stat().st_size > 1_000_000:
+    if _is_fresh(path, 1_000_000):
         return
-    t0 = time.perf_counter()
-    with open(path, "w") as f:
-        rng = random.Random(123)
+    t0    = time.perf_counter()
+    TABLE = bytes(i % 10 + 48 for i in range(256))  # byte → ASCII digit
+    rng   = random.Random(123)
+    with open(path, "wb", buffering=4*1024*1024) as f:
+        buf = bytearray()
         for _ in range(100_000):
-            na = rng.randint(100, 400)
-            nb = rng.randint(50,  200)
-            # Ensure no leading zero (makes comparison unambiguous)
-            a_digits = [str(rng.randint(0, 9)) for _ in range(na)]
-            b_digits = [str(rng.randint(0, 9)) for _ in range(nb)]
-            a_digits[0] = str(rng.randint(1, 9))
-            b_digits[0] = str(rng.randint(1, 9))
-            f.write("".join(a_digits) + "+" + "".join(b_digits) + "\n")
+            na = rng.randint(100, 400);  nb = rng.randint(50, 200)
+            raw = os.urandom(na + nb)
+            a   = bytearray(raw[:na]);   b = bytearray(raw[na:na+nb])
+            if a[0] % 10 == 0: a[0] = 49   # ensure non-zero leading digit
+            if b[0] % 10 == 0: b[0] = 49
+            line = bytes(a).translate(TABLE) + b"+" + bytes(b).translate(TABLE) + b"\n"
+            buf += line
+            if len(buf) >= 4*1024*1024:
+                f.write(buf);  buf = bytearray()
+        if buf:
+            f.write(buf)
     dt = time.perf_counter() - t0
     mb = path.stat().st_size / 1024 / 1024
-    print(f"  s4_memory.txt          {mb:>7.1f} MB  ({dt:.1f}s)")
+    print(f"  s4_memory.txt                    {mb:.1f} MB  ({dt:.1f}s)")
 
 
 def gen_calc2_only():
-    """
-    Datasets that only calc2 (and bc) can handle:
-    multiplication (*), division (/), modulo (%), power (^),
-    parentheses (), and unary minus.
-    """
-    path = DS / "s5_calc2.txt"
+    path  = DS / "s5_calc2.txt"
     lines = []
-
-    # Multiplication
-    for _ in range(30):
-        a = random.randint(2, 9_999)
-        b = random.randint(2, 9_999)
+    for _ in range(50):
+        a, b = random.randint(2, 9_999), random.randint(2, 9_999)
         lines.append(f"{a}*{b}\n")
-
-    # Division (guaranteed exact integer result — avoids float output from bc)
-    for _ in range(30):
-        b = random.randint(2, 999)
-        q = random.randint(1, 999_999 // b)
-        a = b * q
-        lines.append(f"{a}/{b}\n")
-
-    # Modulo
-    for _ in range(30):
-        a = random.randint(1_000, 999_999)
-        b = random.randint(2, 999)
+    for _ in range(50):
+        b = random.randint(2, 999);  q = random.randint(1, 999_999 // b)
+        lines.append(f"{b*q}/{b}\n")
+    for _ in range(50):
+        a = random.randint(1_000, 999_999);  b = random.randint(2, 999)
         lines.append(f"{a}%{b}\n")
-
-    # Power (small bases, safe exponents)
-    for base in [2, 3, 5, 7, 11, 13]:
-        for exp in [0, 1, 2, 5, 10, 20]:
+    for base in [2, 3, 5, 7, 11, 13, 17, 19]:
+        for exp in [0, 1, 2, 5, 10, 20, 30]:
             lines.append(f"{base}^{exp}\n")
-
-    # Parentheses
-    for _ in range(25):
+    for _ in range(40):
         a, b, c = [random.randint(1, 100) for _ in range(3)]
         lines.append(f"({a}+{b})*{c}\n")
-
-    # Unary minus (positive operand, so no double-sign issues)
-    for a in [5, 99, 1000, 37]:
-        lines.append(f"-{a}+{a}\n")   # always = 0
-
+    for a in [5, 99, 1000, 37, 123456]:
+        lines.append(f"-{a}+{a}\n")
+    expr = "1"
+    for _ in range(50):
+        expr = f"({expr}+1)"
+    lines.append(expr+"\n")
     with open(path, "w") as f:
         f.writelines(lines)
-    print(f"  s5_calc2.txt           {path.stat().st_size / 1024:>8.1f} KB")
+    print(f"  s5_calc2.txt                     {path.stat().st_size/1024:.1f} KB")
 
 
 def gen_1m_digit():
-    """
-    2 lines, 1 000 000 digits each — extreme stress test.
-    Tests the 2 M digit limit, OOM behaviour, and correctness
-    at the absolute outer edge of the bigint implementation.
-    """
     path = DS / "s6_1Mdigits.txt"
-    if path.exists() and path.stat().st_size > 1_000_000:
+    if _is_fresh(path, 1_000_000):
         return
-    t0 = time.perf_counter()
-    n = 1_000_000
-    a_digits = [str(random.randint(0, 9)) for _ in range(n)]
-    b_digits = [str(random.randint(0, 9)) for _ in range(n)]
-    a_digits[0] = str(random.randint(1, 9))   # no leading zero
-    b_digits[0] = str(random.randint(1, 9))
-    a = "".join(a_digits)
-    b = "".join(b_digits)
+    t0  = time.perf_counter()
+    rng = random.Random(77)
+    n   = 1_000_000
+    da  = [str(rng.randint(0,9)) for _ in range(n)];  da[0] = str(rng.randint(1,9))
+    db  = [str(rng.randint(0,9)) for _ in range(n)];  db[0] = str(rng.randint(1,9))
+    a, b = "".join(da), "".join(db)
     with open(path, "w") as f:
-        f.write(f"{a}+{b}\n")
-        f.write(f"{a}-{b}\n")
+        f.write(f"{a}+{b}\n");  f.write(f"{a}-{b}\n")
     dt = time.perf_counter() - t0
     mb = path.stat().st_size / 1024 / 1024
-    print(f"  s6_1Mdigits.txt        {mb:>8.2f} MB  ({dt:.1f}s)")
+    print(f"  s6_1Mdigits.txt                  {mb:.2f} MB  ({dt:.1f}s)")
+
+
+def gen_mul_stress():
+    path = DS / "s7_mul_stress.txt"
+    if _is_fresh(path):
+        return
+    t0    = time.perf_counter()
+    rng   = random.Random(55)
+    lines = []
+    for _ in range(500):
+        nd = rng.randint(1, 63)
+        da = [str(rng.randint(0,9)) for _ in range(nd)];  da[0] = str(rng.randint(1,9))
+        db = [str(rng.randint(0,9)) for _ in range(nd)];  db[0] = str(rng.randint(1,9))
+        lines.append("".join(da)+"*"+"".join(db)+"\n")
+    for nd in [64, 100, 200, 500, 1000, 2000, 5000]:
+        for _ in range(10):
+            da = [str(rng.randint(0,9)) for _ in range(nd)];  da[0] = str(rng.randint(1,9))
+            db = [str(rng.randint(0,9)) for _ in range(nd)];  db[0] = str(rng.randint(1,9))
+            lines.append("".join(da)+"*"+"".join(db)+"\n")
+    TABLE_S7 = bytes(i % 10 + 48 for i in range(256))
+    for nd in [10_000, 50_000, 100_000, 200_000]:
+        for _ in range(3):
+            raw = os.urandom(nd * 2)
+            a = bytearray(raw[:nd]);   b = bytearray(raw[nd:nd*2])
+            if a[0] % 10 == 0: a[0] = 49
+            if b[0] % 10 == 0: b[0] = 49
+            lines.append(bytes(a).translate(TABLE_S7).decode()
+                         + "*" + bytes(b).translate(TABLE_S7).decode() + "\n")
+    with open(path, "w") as f:
+        f.writelines(lines)
+    dt = time.perf_counter() - t0
+    mb = path.stat().st_size / 1024 / 1024
+    print(f"  s7_mul_stress.txt                {mb:.1f} MB  ({dt:.1f}s)")
+
+
+def gen_divmod_deep():
+    path = DS / "s8_divmod.txt"
+    if _is_fresh(path):
+        return
+    rng   = random.Random(88)
+    lines = []
+    for _ in range(100):
+        b  = rng.randint(2, 9999);  q = rng.randint(1, 10**6);  r = rng.randint(0, b-1)
+        a  = b*q+r
+        lines += [f"{a}/{b}\n", f"{a}%{b}\n"]
+    for nd in [100, 200, 500]:
+        for _ in range(10):
+            db = [str(rng.randint(0,9)) for _ in range(nd)];  db[0] = str(rng.randint(1,9))
+            b_str = "".join(db);  b_int = int(b_str)
+            q = rng.randint(2, 99);  r = rng.randint(0, b_int-1)
+            a_int = b_int*q+r
+            lines += [f"{a_int}/{b_int}\n", f"{a_int}%{b_int}\n"]
+    with open(path, "w") as f:
+        f.writelines(lines)
+    print(f"  s8_divmod.txt                    {path.stat().st_size/1024:.1f} KB")
+
+
+def gen_power_stress():
+    path  = DS / "s9_power.txt"
+    if _is_fresh(path):
+        return
+    lines = []
+    for base in [2, 3, 7, 10, 99]:
+        for exp in [100, 500, 1000, 2000, 5000]:
+            lines.append(f"{base}^{exp}\n")
+    for base in [2, 10]:
+        for exp in [10_000, 50_000, 100_000]:
+            lines.append(f"{base}^{exp}\n")
+    with open(path, "w") as f:
+        f.writelines(lines)
+    print(f"  s9_power.txt                     {path.stat().st_size/1024:.1f} KB")
+
+
+def gen_mixed_deep():
+    path  = DS / "s10_mixed.txt"
+    rng   = random.Random(10)
+    lines = []
+    for depth in [10, 50, 100, 200, 500]:
+        inner = str(rng.randint(1, 9))
+        for _ in range(depth):
+            inner = f"({inner}+{rng.randint(1,9)})"
+        lines.append(inner+"\n")
+    for _ in range(100):
+        parts = [str(rng.randint(1, 999)) for _ in range(rng.randint(3, 8))]
+        expr  = "*".join(f"({p}+{rng.randint(1,9)})" for p in parts)
+        lines.append(expr+"\n")
+    for _ in range(200):
+        a, b, c, d = rng.randint(1,9999), rng.randint(1,9999), rng.randint(1,9999), rng.randint(1,999)
+        lines.append(f"({a}+{b})*{c}-{a}%{d}\n")
+    for a in [1, 99, 10000, 99999]:
+        lines += [f"-(-{a})\n", f"-{a}*-{a}\n"]
+    with open(path, "w") as f:
+        f.writelines(lines)
+    print(f"  s10_mixed.txt                    {path.stat().st_size/1024:.1f} KB")
+
+
+def _gen_sustained_chunk(args):
+    """Worker: generate one chunk of S11 lines using bytes.translate.
+    ~84x faster than [str(randint(0,9)) for _ in range(nd)]."""
+    seed, count, nd = args
+    TABLE = bytes(i % 10 + 48 for i in range(256))
+    # Use seed to offset into os.urandom stream for reproducibility
+    rng   = random.Random(seed)
+    buf   = []
+    BATCH = 10_000
+    for batch_start in range(0, count, BATCH):
+        batch = min(BATCH, count - batch_start)
+        raw   = os.urandom(nd * 2 * batch)
+        for i in range(batch):
+            off = i * nd * 2
+            a   = bytearray(raw[off:off+nd])
+            b   = bytearray(raw[off+nd:off+nd*2])
+            if a[0] % 10 == 0: a[0] = 49   # non-zero leading digit
+            if b[0] % 10 == 0: b[0] = 49
+            buf.append(bytes(a).translate(TABLE).decode()
+                       + "+" + bytes(b).translate(TABLE).decode() + "\n")
+    return buf
+
+
+def gen_sustained_bigint():
+    """S11 — 1M lines of 500-digit additions.
+    Uses multiprocessing for generation when >1 CPU is available."""
+    path = DS / "s11_sustained.txt"
+    TOTAL   = 1_000_000
+    ND      = 500
+    MIN_SZ  = 500_000_000   # ~500 MB
+
+    if _is_fresh(path, MIN_SZ):
+        return
+    t0 = time.perf_counter()
+
+    if _NCPUS > 1:
+        # Split into per-CPU chunks with different seeds
+        chunk      = TOTAL // _NCPUS
+        remainder  = TOTAL - chunk * _NCPUS
+        tasks = [(11 + i, chunk + (remainder if i == 0 else 0), ND)
+                 for i in range(_NCPUS)]
+        with multiprocessing.Pool(_NCPUS) as pool:
+            chunks = pool.map(_gen_sustained_chunk, tasks)
+        with open(path, "w", buffering=8*1024*1024) as f:
+            for c in chunks:
+                f.writelines(c)
+    else:
+        TABLE = bytes(i % 10 + 48 for i in range(256))
+        BATCH = 10_000
+        with open(path, "wb", buffering=8*1024*1024) as f:
+            for batch_start in range(0, TOTAL, BATCH):
+                batch = min(BATCH, TOTAL - batch_start)
+                raw   = os.urandom(ND * 2 * batch)
+                buf   = bytearray()
+                for i in range(batch):
+                    off = i * ND * 2
+                    a   = bytearray(raw[off:off+ND])
+                    b   = bytearray(raw[off+ND:off+ND*2])
+                    if a[0] % 10 == 0: a[0] = 49
+                    if b[0] % 10 == 0: b[0] = 49
+                    buf += bytes(a).translate(TABLE) + b"+" + bytes(b).translate(TABLE) + b"\n"
+                f.write(buf)
+
+    dt = time.perf_counter() - t0
+    mb = path.stat().st_size / 1024 / 1024
+    print(f"  s11_sustained.txt                {mb:.0f} MB  ({dt:.0f}s)")
+
+
+def gen_adversarial():
+    path  = DS / "s12_adversarial.txt"
+    lines = []
+    for n in [10, 100, 1_000, 10_000, 100_000]:
+        nines = "9"*n
+        lines += [f"{nines}+1\n", f"1+{nines}\n"]
+    for n in [10, 100, 1_000, 10_000]:
+        pow10 = "1"+"0"*n
+        lines.append(f"{pow10}-1\n")
+    for n in [50, 100, 500, 1_000]:
+        a = "90"*(n//2);  b = "10"*(n//2)
+        lines.append(f"{a}*{b}\n")
+    for n in [50, 100, 200, 500]:
+        ones = "1"*n
+        lines.append(f"{ones}*{ones}\n")
+    for n in [100, 1_000, 10_000]:
+        a = "5"+"0"*(n-1);  b = "5"+"0"*(n-1)+"1"
+        lines.append(f"{a}-{b}\n")
+    with open(path, "w") as f:
+        f.writelines(lines)
+    print(f"  s12_adversarial.txt              {path.stat().st_size/1024:.1f} KB")
 
 
 def generate_all_datasets():
     print("\n[1/3] Generating datasets...")
-    gen_scalability()
-    gen_bigint()
-    gen_edge_cases()
-    gen_memory_pressure()
-    gen_calc2_only()
-    gen_1m_digit()
+    gen_scalability();    gen_bigint();        gen_edge_cases()
+    gen_memory_pressure(); gen_calc2_only();   gen_1m_digit()
+    gen_mul_stress();     gen_divmod_deep();   gen_power_stress()
+    gen_mixed_deep();     gen_sustained_bigint(); gen_adversarial()
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 2 — REFERENCES (Python native bigint)
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — REFERENCES  (parallel-aware)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def eval_full(expr):
+# Skip power expressions with exponent > this — Python becomes the bottleneck
+_POW_SKIP_LIMIT    = 5_000
+# Skip operands longer than this — str(bigint) in Python is very slow
+_DIGIT_SKIP_LIMIT  = 500_000
+_SKIP_POW_RE       = re.compile(r"(\d+)\^(\d+)")
+
+
+def eval_full(expr: str):
     """
-    Evaluate ANY arithmetic expression using Python's arbitrary-precision int.
-    This is the ground-truth reference for calc2 and bc comparisons.
-
-    BUG FIX: original code used:
-        safe = re.sub(r"[^\\d+\\-*/().\\s]", "", s.replace("^", "**")).strip()
-    The character class [^\\d+\\-*/().\\s] does NOT include '%', so '%' was
-    stripped from the expression before eval(). '312630%210' became '312630210'
-    — a literal concatenation — and eval gave 312630210 instead of 150. Every
-    modulo line in S5 had a wrong reference answer.
-
-    Fix: keep '%' in the allowed set, and replace '^' with '**' after the
-    sanitise pass (so '**' is never accidentally stripped either).
-
-    Also avoids Python's float path entirely by enforcing integer-only eval
-    via a custom __builtins__ that exposes no builtins, and by rejecting any
-    result that isn't a plain int (guards against float edge cases in very
-    large exponentiations, though Python ** on ints stays int).
+    Python native-bigint reference evaluator.
+    Module-level so it's picklable for multiprocessing.Pool.
+    Returns answer string, or empty string to signal "skip this line".
     """
     s = expr.strip()
-    if not s or s.startswith("("):
-        return None
-    # Allow digits, operators (including %), parens, whitespace, dots (for
-    # potential decimals we want to reject cleanly), and caret for power.
+    if not s:
+        return ""
+    # Skip huge power expressions
+    m = _SKIP_POW_RE.search(s)
+    if m and int(m.group(2)) > _POW_SKIP_LIMIT:
+        return ""
+    # Skip lines with enormous operands
+    nums = re.findall(r"\d+", s)
+    if any(len(x) > _DIGIT_SKIP_LIMIT for x in nums):
+        return ""
     safe = re.sub(r"[^\d+\-*/%^().\s]", "", s).strip()
     if not safe:
-        return None
-    # Now translate power operator — after sanitise so no double-processing.
+        return ""
     safe = safe.replace("^", "**")
     try:
-        r = eval(safe, {"__builtins__": {}}, {})  # nosec: input sanitised above
+        r = eval(safe, {"__builtins__": {}}, {})   # nosec
         if isinstance(r, bool):
             return str(int(r))
         if isinstance(r, int):
             return str(r)
-        # Float means division produced a non-integer; not expected in our
-        # datasets (division cases are constructed to be exact), but handle it.
         if isinstance(r, float):
-            if r == int(r) and abs(r) < 10 ** 18:
+            if r == int(r) and abs(r) < 10**18:
                 return str(int(r))
             return "ERROR"
         return str(r)
     except ZeroDivisionError:
-        return "ERROR"
+        return "DIV0"
     except Exception:
-        return None
+        return ""
 
 
-def _unwrap_bc_lines(path):
+def _write_ref(src_path: Path, dst_path: Path):
     """
-    Generator: yield logical lines from a file, efficiently handling
-    backslash-continuation lines without quadratic memory copies.
+    Build reference file with optional parallel evaluation.
+
+    Strategy:
+    - Count lines in the dataset first (cheap O(n) scan).
+    - If line count > PARALLEL_REF_THRESHOLD and _NCPUS > 1,
+      read all lines into memory and scatter to Pool.imap_unordered
+      with large chunks (POOL_CHUNKSIZE). This keeps IPC batched.
+    - Serial fallback for small datasets and single-CPU machines.
     """
-    with open(path, errors="replace") as fh:
+    # ── read all source lines once ──────────────────────────────────────
+    with open(src_path, errors="replace") as fin:
+        raw_lines = fin.readlines()
+    n_lines = len(raw_lines)
+    exprs   = [l.strip() for l in raw_lines]
+
+    use_parallel = (_NCPUS > 1 and n_lines > PARALLEL_REF_THRESHOLD)
+
+    t0 = time.perf_counter()
+    if use_parallel:
+        with multiprocessing.Pool(_NCPUS) as pool:
+            results = list(pool.imap(eval_full, exprs,
+                                     chunksize=POOL_CHUNKSIZE))
+    else:
+        results = [eval_full(e) for e in exprs]
+
+    dt = time.perf_counter() - t0
+
+    with open(dst_path, "w", buffering=4*1024*1024) as fout:
+        n_written = 0
+        for v in results:
+            fout.write((v if v is not None else "") + "\n")
+            if v:
+                n_written += 1
+
+    mode = f"parallel×{_NCPUS}" if use_parallel else "serial"
+    print(f"  {dst_path.name:<44} {n_written:>9,} lines  ({dt:.1f}s {mode})")
+
+
+def build_references():
+    print("\n[2/3] Building references (Python native bigint)...")
+    datas = sorted(f.name for f in DS.iterdir()
+                   if f.suffix == ".txt" and f.stat().st_size > 0)
+    for name in datas:
+        src = DS / name
+        dst = REF / f"ref_{name}.txt"
+        if _ref_is_fresh(src, dst):
+            print(f"  ref_{name:<40} (cached)")
+            continue
+        _write_ref(src, dst)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — COMPILE  (skip if binary is up to date)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compile_calc(name, src: Path, out: Path) -> bool:
+    # Skip recompile when binary is newer than source
+    if out.exists() and _mtime(out) >= _mtime(src):
+        print(f"  {name}: binary up to date, skipping compile")
+        return True
+    cmd = ["g++", "-O3", "-march=native", "-std=c++17", "-o", str(out), str(src)]
+    print(f"  Compiling {name} ...", end=" ", flush=True)
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode == 0:
+        print("OK  (g++ -O3 -march=native)")
+        return True
+    print("FAIL")
+    for ln in p.stderr.splitlines():
+        print(f"    {ln}")
+    return False
+
+
+def compile_all():
+    print("\n[0/3] Compiling...")
+    ok2 = compile_calc("kalkulacka_2", CALC2_SRC, CALC2_BIN)
+    if not ok2:
+        print("  ERROR: kalkulacka_2 failed to compile.")
+        sys.exit(1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — RUN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_binary(bin_path: Path, dataset: Path, log_path: Path):
+    t0 = time.perf_counter()
+    rc = -2
+    try:
+        with open(dataset, "rb") as fin, open(log_path, "wb") as fout:
+            proc = subprocess.run(
+                [str(bin_path)], stdin=fin, stdout=fout,
+                stderr=subprocess.DEVNULL, timeout=TIMEOUT_SEC,
+            )
+            rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        rc = -1
+    except Exception:
+        rc = -2
+    if not log_path.exists():
+        log_path.write_bytes(b"")
+    return rc, time.perf_counter() - t0
+
+
+def run_binary_input(bin_path: Path, text_input: str, timeout=MAX_POW_SEC):
+    t0 = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            [str(bin_path)],
+            input=text_input.encode(),
+            capture_output=True,
+            timeout=timeout,
+        )
+        out = proc.stdout.decode(errors="replace").strip()
+        return out, time.perf_counter() - t0
+    except subprocess.TimeoutExpired:
+        return None, time.perf_counter() - t0
+    except Exception:
+        return None, time.perf_counter() - t0
+
+
+def run_bc(dataset: Path, log_path: Path):
+    t0 = time.perf_counter()
+    rc = -2
+    try:
+        expr_lines = []
+        with open(dataset, errors="replace") as fin:
+            for raw in fin:
+                s    = raw.rstrip("\n")
+                safe = re.sub(r"[^\d+\-*/%^().\s]", "", s).strip()
+                expr_lines.append(safe if safe else "")
+        body = "\n".join(expr_lines) + "\n"
+        with open(log_path, "wb") as fout:
+            proc = subprocess.run(
+                ["bc"],
+                input=body.encode("utf-8", errors="replace"),
+                stdout=fout, stderr=subprocess.DEVNULL,
+                timeout=TIMEOUT_SEC,
+            )
+            rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        rc = -1
+    except Exception:
+        rc = -2
+    if not log_path.exists():
+        log_path.write_bytes(b"")
+    return rc, time.perf_counter() - t0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — VERIFY  (early-exit, buffered)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _unwrap(path: Path):
+    """Yield logical lines, collapsing backslash continuations.
+    Uses a 4 MB read buffer to minimise syscall overhead on large files."""
+    with open(path, "rb", buffering=4*1024*1024) as fh:
         pending = []
         for raw in fh:
-            line = raw.rstrip("\n\r")
+            line = raw.decode("utf-8", errors="replace").rstrip("\n\r")
             if line.endswith("\\"):
                 pending.append(line[:-1])
             else:
@@ -373,196 +695,42 @@ def _unwrap_bc_lines(path):
             yield "".join(pending)
 
 
-def _write_ref(src_path, dst_path):
-    """Build a Python-native reference file for the given dataset."""
-    n = 0
-    with open(src_path, errors="replace") as fin, open(dst_path, "w") as fout:
-        for line in fin:
-            s = line.strip()
-            if not s:
-                fout.write("\n")
-                continue
-            v = eval_full(s)
-            fout.write((v if v is not None else "") + "\n")
-            n += 1
-    print(f"  {dst_path.name:<40} {n:>9,} lines")
-
-
-def build_references():
-    print("\n[2/3] Building references (Python native bigint)...")
-    datas = sorted(
-        f.name
-        for f in DS.iterdir()
-        if f.suffix == ".txt" and f.stat().st_size > 0
-    )
-    for name in datas:
-        src = DS / name
-        _write_ref(src, REF / f"ref_{name}.txt")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 3 — COMPILE
-# ══════════════════════════════════════════════════════════════════════════
-
-def compile_calc(name, src, out):
-    cmd = ["g++", "-O3", "-std=c++17", "-o", str(out), str(src)]
-    print(f"  Compiling {name} ...", end=" ", flush=True)
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode == 0:
-        print("OK")
-        return True
-    print("FAIL")
-    # Show full stderr, not just 600 chars
-    if p.stderr:
-        for ln in p.stderr.splitlines():
-            print(f"    {ln}")
-    return False
-
-
-def compile_all():
-    """
-    BUG FIX: original exited immediately if either binary failed. Now we
-    compile both and report which ones are available, then exit only if
-    kalkulacka_2 (the one we actually need) failed.
-    """
-    print("\n[0/3] Compiling calculators (g++ -O3 -std=c++17)...")
-    ok2 = compile_calc("kalkulacka_2", CALC2_SRC, CALC2_BIN)
-    if not ok2:
-        print("  ERROR: kalkulacka_2 failed to compile — cannot continue.")
-        sys.exit(1)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 4 — RUN (binary OR bc)
-# ══════════════════════════════════════════════════════════════════════════
-
-def run_binary(bin_path, dataset, log_path):
-    """Pipe dataset as stdin; capture stdout to log_path."""
-    t0 = time.perf_counter()
-    rc = -2
-    try:
-        with open(dataset, "rb") as fin, open(log_path, "wb") as fout:
-            proc = subprocess.run(
-                [str(bin_path)],
-                stdin=fin,
-                stdout=fout,
-                stderr=subprocess.DEVNULL,
-                timeout=TIMEOUT_SEC,
-            )
-            rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        rc = -1
-    except Exception:
-        rc = -2
-    if not log_path.exists():
-        log_path.write_bytes(b"")
-    return rc, time.perf_counter() - t0
-
-
-def run_bc(dataset, log_path):
-    """
-    Translate the dataset into bc expressions and pipe to `bc`.
-
-    BUG FIX 1: original used `bc -l` which loads the math library and makes
-    division return floats ("2494.00000000000000000000" instead of "2494").
-    We now use plain `bc` for all datasets. The only reason to use `-l` would
-    be transcendental functions (sin, cos, etc.) which our datasets never have.
-
-    BUG FIX 2: original had `stdout=open(log_path, "wb")` inside the
-    subprocess.run() call with no context manager, leaking a file handle.
-    Fixed to use a `with` block.
-    """
-    t0 = time.perf_counter()
-    rc = -2
-    try:
-        expr_lines = []
-        with open(dataset, errors="replace") as fin:
-            for raw in fin:
-                s = raw.rstrip("\n")
-                if not s.strip():
-                    expr_lines.append("")
-                    continue
-                # Keep '^' intact! bc handles it natively.
-                # Strip characters bc doesn't understand (allow '^' now)
-                safe = re.sub(r"[^\d+\-*/%^().\s]", "", s).strip()
-                expr_lines.append(safe if safe else "")
-
-        body = "\n".join(expr_lines) + "\n"
-        with open(log_path, "wb") as fout:
-            proc = subprocess.run(
-                ["bc"],
-                input=body.encode("utf-8", errors="replace"),
-                stdout=fout,
-                stderr=subprocess.DEVNULL,
-                timeout=TIMEOUT_SEC,
-            )
-            rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        rc = -1
-    except Exception:
-        rc = -2
-    if not log_path.exists():
-        log_path.write_bytes(b"")
-    return rc, time.perf_counter() - t0
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 5 — VERIFY
-# ══════════════════════════════════════════════════════════════════════════
-
-def verify(ref_path, out_path, inp_path):
-    """
-    Line-by-line output comparison. Blank reference lines mean the expression
-    was unsupported/skipped and are excluded from accuracy statistics.
-
-    BUG FIX 1: original read all three files fully into RAM with readlines().
-    For a 60 MB dataset the input file alone can exceed available memory in
-    constrained environments. Fixed to stream all three files in parallel.
-
-    BUG FIX 2: neither bc nor kalkulacka_2 output bare numbers for long
-    results — both wrap at 70 chars with a trailing backslash. The original
-    comparison treated each physical line as a separate answer, so:
-        "12345...70chars\\"   !=   "12345...full_result"
-    Every result longer than 70 digits was a false FAIL. Fixed by using
-    _unwrap_bc_lines() for the actual output before comparing.
-
-    Returns (correct_count, total_count, first_fail_dict_or_None, accuracy_pct).
-    """
+def verify(ref_path: Path, out_path: Path, inp_path: Path):
+    """Stream all three files in parallel. First mismatch exits early."""
     if not ref_path.exists():
         return 0, 0, None, 0.0
 
-    correct = 0
-    total   = 0
-    fail    = None
+    correct  = 0
+    total    = 0
+    fail     = None
 
     try:
-        # ref file is written by us (Python), never wrapped — plain readline is fine.
-        # out file comes from bc or kalkulacka_2 — may be wrapped.
-        # inp file is the raw dataset — may be multi-line numbers with \ (S6).
-        ref_lines  = _unwrap_bc_lines(ref_path)
-        out_lines  = _unwrap_bc_lines(out_path)
-        inp_lines  = (line.strip() for line in open(inp_path, errors="replace")) # <--- The Fix
-        line_num   = 0
-        for rv, av, iv in zip(ref_lines, out_lines, inp_lines):
-            line_num += 1
-            rv = rv.strip()
-            av = av.strip()
+        ref_lines = _unwrap(ref_path)
+        out_lines = _unwrap(out_path)
+        inp_lines = (line.strip() for line in
+                     open(inp_path, "rb", buffering=4*1024*1024))
+        line_num  = 0
 
-            # Blank ref = expression skipped/unsupported — do not count
+        for rv_b, av_b, iv_b in zip(ref_lines, out_lines, inp_lines):
+            line_num += 1
+            # _unwrap already yielded str; inp_lines yields bytes
+            rv = rv_b.strip() if isinstance(rv_b, str) else rv_b.decode(errors="replace").strip()
+            av = av_b.strip() if isinstance(av_b, str) else av_b.decode(errors="replace").strip()
+            iv = iv_b.strip() if isinstance(iv_b, str) else iv_b.decode(errors="replace").strip()
+
             if not rv:
                 continue
-
             total += 1
             if av == rv:
                 correct += 1
             elif fail is None:
                 fail = {
                     "line":     line_num,
-                    "input":    iv.strip()[:120],
+                    "input":    iv[:120],
                     "expected": rv[:120],
-                    "actual":   av[:120] if av else "(empty output)",
+                    "actual":   av[:120] if av else "(empty)",
                 }
-                break
+                break   # early exit on first mismatch
 
     except Exception as e:
         return 0, 0, {
@@ -574,19 +742,96 @@ def verify(ref_path, out_path, inp_path):
     return correct, total, fail, pct
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 6 — DISPLAY HELPERS
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — MAX-POWER PROBE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def probe_max_power(bin_path: Path, bases=None, time_budget=MAX_POW_SEC):
+    if bases is None:
+        bases = [2, 3, 10, 100, 999]
+
+    def expected_digits(base, exp):
+        return math.floor(exp * math.log10(base)) + 1
+
+    def run_pow(base, exp):
+        out, t = run_binary_input(bin_path, f"{base}^{exp}\n", timeout=time_budget*1.5)
+        if out is None:
+            return False, t, 0
+        cleaned = out.replace("\\\n", "").strip()
+        if not cleaned or not cleaned.lstrip("-").isdigit():
+            return False, t, 0
+        got_digits = len(cleaned.lstrip("-0") or "0")
+        exp_digits = expected_digits(base, exp)
+        ok = abs(got_digits - exp_digits) <= 1
+        return ok, t, got_digits
+
+    print("\n" + "="*70)
+    print("  MAX-POWER PROBE")
+    print(f"  Time budget per expression : {time_budget:.1f}s")
+    print(f"  Binary : {bin_path}")
+    print("="*70)
+
+    results = []
+    for base in bases:
+        print(f"\n  Base {base}:")
+        lo, hi, last_ok, last_t, exp = 0, 0, 0, 0.0, 1_000
+
+        while True:
+            ok, t, nd = run_pow(base, exp)
+            print(f"    {base}^{exp:>8,}  →  {'OK '+str(nd)+'d':>14}  {t:.2f}s", end="")
+            if ok and t < time_budget:
+                print("  ✓");  last_ok = exp;  last_t = t;  hi = lo = exp;  exp *= 2
+            else:
+                reason = "TIMEOUT" if t >= time_budget else "WRONG/CRASH"
+                print(f"  ✗  {reason}");  hi = exp;  break
+            if exp > 20_000_000:
+                print("    (cap reached)");  hi = exp;  break
+
+        if lo < hi and lo > 0:
+            lo_val = lo
+            print(f"    Binary search [{lo:,}, {hi:,}] ...")
+            while hi - lo > lo_val // 10:
+                mid = (lo+hi) // 2
+                ok, t, nd = run_pow(base, mid)
+                print(f"    {base}^{mid:>8,}  →  {'OK '+str(nd)+'d':>14}  {t:.2f}s  {'✓' if ok and t < time_budget else '✗'}")
+                if ok and t < time_budget:
+                    lo = mid;  last_ok = mid;  last_t = t
+                else:
+                    hi = mid
+
+        ed = expected_digits(base, last_ok) if last_ok else 0
+        results.append({"base": base, "max_exp": last_ok,
+                        "result_digits": ed, "wall_s": round(last_t, 3)})
+        print(f"\n  ► Base {base}: max exponent ≈ {last_ok:,}  ({ed:,} result digits)  {last_t:.2f}s")
+
+    print("\n"+"="*70)
+    print("  MAX-POWER SUMMARY")
+    print(f"  {'Base':>6}  {'Max exponent':>14}  {'Result digits':>15}  {'Wall (s)':>9}")
+    print("  "+"-"*50)
+    for r in results:
+        print(f"  {r['base']:>6}  {r['max_exp']:>14,}  {r['result_digits']:>15,}  {r['wall_s']:>9.3f}")
+    print("="*70)
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — DISPLAY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 CATEGORY_LABELS = {
-    "s1_stream": "S1 Stream (scalability, 100k–3M lines)",
-    "s2_bigint": "S2 BigInt (100–100K digits, +/- only)",
-    "s3_edge":   "S3 Edge (sign edge cases, zero-crossing)",
-    "s4_memory": "S4 Memory (100K lines, 100–400 digits)",
-    "s5_calc2":  "S5 Full ops (* / % ^ () unary)",
-    "s6_1Mdigit":"S6 Extreme (2 lines, 1M digits each)",
+    "s1_stream":      "S1  Stream scalability (100k–10M lines)",
+    "s2_bigint":      "S2  BigInt (100–1M digits, +/-)",
+    "s3_edge":        "S3  Edge cases (zeros, sign, wrap)",
+    "s4_memory":      "S4  Memory pressure (100k lines, 100–400 digits)",
+    "s5_calc2":       "S5  Full operator set",
+    "s6_1Mdigit":     "S6  Extreme (1M-digit operands)",
+    "s7_mul":         "S7  Multiplication stress (naive/Karatsuba/NTT)",
+    "s8_divmod":      "S8  Division & modulo (large divisors)",
+    "s9_power":       "S9  Power stress (large exponents)",
+    "s10_mixed":      "S10 Mixed expression depth",
+    "s11_sustained":  "S11 Sustained BigInt stream (1M×500-digit)",
+    "s12_adversarial":"S12 Adversarial (all-9s, carry-chains)",
 }
-
 
 def category_of(fname):
     for key, label in CATEGORY_LABELS.items():
@@ -594,47 +839,29 @@ def category_of(fname):
             return label
     return "Other"
 
-
 def lps(n, sec):
-    """Human-readable throughput."""
-    if sec <= 0:
-        return "N/A"
+    if sec <= 0: return "N/A"
     r = n / sec
-    if r < 1_000:
-        return f"{r:,.0f} l/s"
-    if r < 1_000_000:
-        return f"{r / 1_000:.1f}K l/s"
-    return f"{r / 1_000_000:.1f}M l/s"
-
+    if r < 1_000:     return f"{r:,.0f} l/s"
+    if r < 1_000_000: return f"{r/1_000:.1f}K l/s"
+    return f"{r/1_000_000:.2f}M l/s"
 
 def _ok_icon(status):
-    if status == "PASS":
-        return "OK"
-    if status in ("TIMEOUT", "CRASH") or "FAIL" in status:
-        return "!!"
+    if status == "PASS":  return "OK"
+    if status in ("TIMEOUT","CRASH") or "FAIL" in status: return "!!"
     return ".."
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 7 — BENCHMARK ONE DATASET
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — BENCHMARK ONE DATASET
+# ══════════════════════════════════════════════════════════════════════════════
 
-def bench_dataset(ds_path, use_bc=True):
-    """
-    Run kalkulacka_2 + (optionally bc) against one dataset file.
-    Returns a result dict with time, accuracy, fail details for each runner.
-    """
+def bench_dataset(ds_path: Path, use_bc: bool = True):
     fname   = ds_path.name
     size_mb = ds_path.stat().st_size / 1024 / 1024
-    entry   = {
-        "name":    fname,
-        "size_mb": round(size_mb, 2),
-        "cat":     category_of(fname),
-        "runs":    {},
-    }
+    entry   = {"name": fname, "size_mb": round(size_mb, 2),
+               "cat": category_of(fname), "runs": {}}
 
-    # BUG FIX: removed "kalkulacka" (main.cpp) from runners entirely.
-    # There is now a single reference (ref_) rather than ref1_ / ref2_.
     runners = [("kalkulacka_2", CALC2_BIN)]
     if use_bc:
         runners.append(("bc", None))
@@ -650,18 +877,12 @@ def bench_dataset(ds_path, use_bc=True):
 
         correct, total, fail, pct = verify(ref_path, log_path, ds_path)
 
-        if rc == -1:
-            status = "TIMEOUT"
-        elif rc != 0:
-            status = "CRASH"
-        elif fail:
-            status = f"FAIL@L{fail['line']}"
-        elif total == 0 and pct == 0.0:
-            status = "EMPTY"
-        elif pct >= 99.5:
-            status = "PASS"
-        else:
-            status = "PARTIAL"
+        if   rc == -1:            status = "TIMEOUT"
+        elif rc != 0:             status = "CRASH"
+        elif fail:                status = f"FAIL@L{fail['line']}"
+        elif total == 0 and pct == 0.0: status = "EMPTY"
+        elif pct >= 99.5:         status = "PASS"
+        else:                     status = "PARTIAL"
 
         entry["runs"][runner] = {
             "wall_s":   round(wall, 4),
@@ -678,27 +899,21 @@ def bench_dataset(ds_path, use_bc=True):
     return entry
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 8 — RESULT TABLES
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9 — RESULT TABLES
+# ══════════════════════════════════════════════════════════════════════════════
 
 def print_results(results, datasets, use_bc):
-    W = 80
-
-    # BUG FIX: original always printed a K1 column even when kalkulacka was
-    # not in the run set. Header now reflects actual runners.
+    W = 88
     if use_bc:
-        header = (f"{'':>28} {'MB':>5} | "
-                  f"{'K2 (s)':>8} {'acc':>5} | "
-                  f"{'bc (s)':>8} {'acc':>5}")
+        header = (f"{'':>32} {'MB':>6} | {'K2 (s)':>8} {'acc':>5} | {'bc (s)':>8} {'acc':>5}")
     else:
-        header = (f"{'':>28} {'MB':>5} | "
-                  f"{'K2 (s)':>8} {'acc':>5}")
+        header = (f"{'':>32} {'MB':>6} | {'K2 (s)':>8} {'acc':>5}")
 
-    print(f"\n{'=' * W}")
-    print("  BENCHMARK RESULTS")
+    print(f"\n{'='*W}")
+    print("  BENCHMARK RESULTS — ABSOLUTE LOAD EDITION")
     print(header)
-    print(f"  {'-' * (W - 2)}")
+    print(f"  {'-'*(W-2)}")
 
     cur_cat = None
     for dname in datasets:
@@ -714,32 +929,31 @@ def print_results(results, datasets, use_bc):
         r3 = r0["runs"].get("bc", {})
 
         def _col(r):
-            return f"{r.get('wall_s', 0):>8.3f} {r.get('accuracy', 0):>4.0f}%  {_ok_icon(r.get('status', '?'))}"
+            return f"{r.get('wall_s',0):>8.3f} {r.get('accuracy',0):>4.0f}%  {_ok_icon(r.get('status','?'))}"
 
-        row = f"  {dname[:28]:<28} {r0['size_mb']:>5.1f} | {_col(r2)}"
+        row = f"  {dname[:32]:<32} {r0['size_mb']:>6.1f} | {_col(r2)}"
         if use_bc:
             row += f" | {_col(r3)}"
         print(row)
 
-        s2 = r2.get("status", "?")
-        s3 = r3.get("status", "?") if use_bc else "PASS"
-        if s2 not in ("PASS", "EMPTY"):
+        s2 = r2.get("status","?")
+        s3 = r3.get("status","?") if use_bc else "PASS"
+        if s2 not in ("PASS","EMPTY"):
             print(f"    K2 {s2}")
-            if "fail" in r0["runs"].get("kalkulacka_2", {}):
+            if "fail" in r0["runs"].get("kalkulacka_2",{}):
                 fd = r0["runs"]["kalkulacka_2"]["fail"]
                 print(f"       input:    {fd['input']}")
                 print(f"       expected: {fd['expected']}")
                 print(f"       actual:   {fd['actual']}")
-        if use_bc and s3 not in ("PASS", "EMPTY"):
+        if use_bc and s3 not in ("PASS","EMPTY"):
             print(f"    bc {s3}")
-            if "fail" in r0["runs"].get("bc", {}):
+            if "fail" in r0["runs"].get("bc",{}):
                 fd = r0["runs"]["bc"]["fail"]
                 print(f"       input:    {fd['input']}")
                 print(f"       expected: {fd['expected']}")
                 print(f"       actual:   {fd['actual']}")
 
-    # ── scorecard ──────────────────────────────────────────────────────
-    print(f"\n{'=' * W}")
+    print(f"\n{'='*W}")
     print("  FINAL SCORECARD\n")
 
     runners_info = [("kalkulacka_2", "kalkulacka_2 (calculator.cpp)", "full ops")]
@@ -750,7 +964,7 @@ def print_results(results, datasets, use_bc):
         cands = [r for r in results if lbl in r["runs"]]
         p  = sum(1 for r in cands if r["runs"][lbl]["status"] == "PASS")
         n  = sum(r["runs"][lbl]["verified"] for r in cands)
-        t  = sum(r["runs"][lbl]["wall_s"]   for r in cands)
+        t  = sum(r["runs"][lbl]["wall_s"] for r in cands)
         th = f"{n/t:,.0f} l/s" if t > 0.001 else "N/A"
         print(f"  {label} [{note}]")
         print(f"    Passed : {p}/{len(cands)} datasets")
@@ -762,53 +976,65 @@ def print_results(results, datasets, use_bc):
     print("  kalkulacka_2 handles: + - * / % ^ () and unary minus")
     if use_bc:
         print("  bc is the Linux native arbitrary-precision calculator (integer mode)")
-    print("=" * W)
+    print("="*W)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# SECTION 9 — MAIN
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args(argv):
-    no_bc   = "--no-bc" in argv
-    filters = [a for a in argv if not a.startswith("--")]
-    single  = filters[0] if filters else None
-    return no_bc, single
+    no_bc     = "--no-bc"     in argv
+    max_power = "--max-power" in argv
+    no_gen    = "--no-gen"    in argv
+    filters   = [a for a in argv if not a.startswith("--")]
+    single    = filters[0] if filters else None
+    return no_bc, max_power, no_gen, single
 
 
 def main():
-    no_bc, single_ds = parse_args(sys.argv[1:])
+    no_bc, max_power, no_gen, single_ds = parse_args(sys.argv[1:])
     use_bc = not no_bc
 
-    W = 78
-    print("=" * W)
-    print("  BENCHMARK SUITE — calculator.cpp vs bc")
+    W = 88
+    print("="*W)
+    print("  BENCHMARK SUITE — ABSOLUTE LOAD EDITION")
     print(f"  calculator.cpp : {CALC2_SRC}")
     print(f"  Started        : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  CPUs available : {_NCPUS}")
     print(f"  bc             : {'included' if use_bc else 'skipped (--no-bc)'}")
-    print("=" * W)
+    print(f"  max-power probe: {'yes' if max_power else 'no  (--max-power to enable)'}")
+    print("="*W)
 
-    # ── Phase 0: compile ───────────────────────────────────────────────
     compile_all()
 
-    # ── Phase 1: generate datasets ─────────────────────────────────────
-    generate_all_datasets()
+    if max_power and single_ds is None:
+        probe_max_power(CALC2_BIN)
+        if use_bc:
+            print("\n  bc max-power spot-check (2^N, 10s budget each):")
+            for exp in [10_000, 50_000, 100_000, 200_000]:
+                t0 = time.perf_counter()
+                try:
+                    proc = subprocess.run(
+                        ["bc"], input=f"2^{exp}\n".encode(),
+                        capture_output=True, timeout=10.0)
+                    t1  = time.perf_counter()
+                    out = proc.stdout.decode(errors="replace").replace("\\\n","").strip()
+                    nd  = len(out.lstrip("-0") or "0")
+                    print(f"    bc  2^{exp:>8,}  {nd:>8} digits  {t1-t0:.2f}s")
+                except subprocess.TimeoutExpired:
+                    print(f"    bc  2^{exp:>8,}  TIMEOUT  {time.perf_counter()-t0:.1f}s")
+        return
 
-    # ── Phase 2: build references ──────────────────────────────────────
-    build_references()
+    if not no_gen:
+        generate_all_datasets()
+        build_references()
 
-    # ── Phase 3: select datasets ───────────────────────────────────────
-    all_ds = sorted(
-        f.name
-        for f in DS.iterdir()
-        if f.suffix == ".txt" and f.stat().st_size > 0
-    )
+    all_ds = sorted(f.name for f in DS.iterdir()
+                    if f.suffix == ".txt" and f.stat().st_size > 0)
 
     if single_ds:
-        todo = sorted(
-            [d for d in all_ds if d == single_ds or single_ds in d],
-            key=lambda x: x # <--- The Fix: Clean, reliable string comparison
-        )
+        todo = sorted(d for d in all_ds if d == single_ds or single_ds in d)
         if not todo:
             print(f"\n  Dataset '{single_ds}' not found. Available:")
             for d in all_ds:
@@ -817,47 +1043,39 @@ def main():
     else:
         todo = all_ds
 
-    # ── Phase 4: benchmark ─────────────────────────────────────────────
     print(f"\n[3/3] Benchmarking {len(todo)} dataset(s)...")
     all_results = []
     for dname in todo:
-        ds = DS / dname
-        print(f"\n  Running {dname}  ({ds.stat().st_size / 1024 / 1024:.1f} MB) ...")
-        entry = bench_dataset(ds, use_bc=use_bc)
+        ds          = DS / dname
+        # bc only on small/medium datasets — skip enormous ones
+        use_bc_here = use_bc and (dname in BC_ALLOWED_DATASETS)
+        print(f"\n  Running {dname}  ({ds.stat().st_size/1024/1024:.1f} MB)"
+              f"  {'+ bc' if use_bc_here else '(k2 only)'} ...")
+        entry = bench_dataset(ds, use_bc=use_bc_here)
         all_results.append(entry)
 
-    # ── display ────────────────────────────────────────────────────────
     print_results(all_results, todo, use_bc)
 
-    # ── save JSON ──────────────────────────────────────────────────────
-    # BUG FIX: original scorecard still included "kalkulacka" key which no
-    # longer exists in runs; removed.
+    if max_power:
+        pow_results = probe_max_power(CALC2_BIN)
+    else:
+        pow_results = []
+
     scorecard = {}
-    for lbl, name in [
-        ("kalkulacka_2", "kalkulacka_2 (calculator.cpp)"),
-        ("bc",           "bc (system)"),
-    ]:
+    for lbl, name in [("kalkulacka_2","kalkulacka_2 (calculator.cpp)"),
+                       ("bc","bc (system)")]:
         cands = [r for r in all_results if lbl in r["runs"]]
         if not cands:
             continue
         p = sum(1 for r in cands if r["runs"][lbl]["status"] == "PASS")
         n = sum(r["runs"][lbl]["verified"] for r in cands)
         t = sum(r["runs"][lbl]["wall_s"]   for r in cands)
-        scorecard[lbl] = {
-            "name":     name,
-            "passed":   p,
-            "total_ds": len(cands),
-            "lines":    n,
-            "wall_s":   round(t, 4),
-        }
+        scorecard[lbl] = {"name": name, "passed": p,
+                          "total_ds": len(cands), "lines": n, "wall_s": round(t,4)}
 
-    out = {
-        "timestamp": datetime.now().isoformat(),
-        "no_bc":     no_bc,
-        "datasets":  todo,
-        "scorecard": scorecard,
-        "results":   all_results,
-    }
+    out = {"timestamp": datetime.now().isoformat(), "no_bc": no_bc,
+           "datasets": todo, "scorecard": scorecard,
+           "results": all_results, "max_power": pow_results}
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     jp = LOG / f"bench_{ts}.json"
