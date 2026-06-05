@@ -1,5 +1,34 @@
-/.vscode/
+# ─── Compiled binary ───────────────────────────────────────────────────────
 bin/
+
+# ─── Generated datasets (large, reproducible) ──────────────────────────────
 datasets/
+
+# ─── Reference answers (reproducible from datasets) ────────────────────────
 reference/
+
+# ─── Benchmark logs and JSON reports ───────────────────────────────────────
 results/
+
+# ─── C++ build artifacts ────────────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.out
+
+# ─── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# ─── OS noise ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Editors ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
