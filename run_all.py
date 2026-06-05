@@ -1049,8 +1049,8 @@ def main():
         ds          = DS / dname
         # bc only on small/medium datasets — skip enormous ones
         use_bc_here = use_bc and (dname in BC_ALLOWED_DATASETS)
-        print(f"\n  Running {dname}  ({ds.stat().st_size/1024/1024:.1f} MB)"
-              f"  {'+ bc' if use_bc_here else '(k2 only)'} ...")
+        print(f"\n  Running {dname}  ({ds.stat().st_size/1024/1024:.1f} MB) "
+              f"{'+ bc' if use_bc_here else '(k2 only)'} ...")
         entry = bench_dataset(ds, use_bc=use_bc_here)
         all_results.append(entry)
 
